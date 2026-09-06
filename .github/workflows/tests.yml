@@ -1,0 +1,44 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  # Pin the Hermes secret-source contract we test against; bump deliberately.
+  HERMES_AGENT_REF: v2026.8.31
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout plugin
+        uses: actions/checkout@v7
+
+      - name: Checkout hermes-agent secret-source contract
+        uses: actions/checkout@v7
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ env.HERMES_AGENT_REF }}
+          sparse-checkout: |
+            agent/secret_sources
+            hermes_constants.py
+            tests/__init__.py
+            tests/secret_sources
+          sparse-checkout-cone-mode: false
+          path: .hermes-agent
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Run tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}/.hermes-agent
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: uv run pytest tests/

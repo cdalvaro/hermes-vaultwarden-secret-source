@@ -1,0 +1,4 @@
+name: vaultwarden-secret-source
+version: "1.0.0"
+description: Read Hermes credentials from self-hosted Vaultwarden items through the official Bitwarden CLI.
+kind: standalone
