@@ -144,6 +144,11 @@ Then verify only safe state:
 
 ## Local validation
 
+The plugin supports Python 3.11 through 3.14. CI runs the hermetic suite and
+Hermes' secret-source conformance checks on each supported Python minor against
+the pinned Hermes Agent v0.22.7 contract, including the Python 3.14 runtime used
+by its Docker image.
+
 Dependencies are managed with [uv](https://docs.astral.sh/uv/). `uv run`
 creates `.venv/` and installs the `dev` dependency group from `pyproject.toml`
 and `uv.lock`.
