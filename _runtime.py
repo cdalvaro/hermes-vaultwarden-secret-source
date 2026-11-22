@@ -18,6 +18,13 @@ from typing import Optional
 
 _SESSION_FILENAME = "session"
 _LOCK_FILENAME = "bootstrap.lock"
+_BW_STATE_DIRNAME = ".bitwarden"
+
+
+def bw_state_dir(runtime_dir: Path) -> Path:
+    """Where bw keeps its account state (``BITWARDENCLI_APPDATA_DIR``).
+    Defined once so that invalidation always wipes what bw actually wrote."""
+    return runtime_dir / _BW_STATE_DIRNAME
 
 
 def remaining_seconds(deadline: float) -> Optional[float]:
@@ -100,7 +107,10 @@ def write_runtime_session(runtime_dir: Path, session: str) -> bool:
 
 
 def invalidate_runtime_bootstrap(runtime_dir: Path) -> None:
-    for path in (runtime_dir / _SESSION_FILENAME, runtime_dir / ".config"):
+    """Return the task to a clean, unauthenticated state: no shared session
+    and no bw account state. bw refuses ``config server`` while any account is
+    logged in, so leftover state would block every later bootstrap."""
+    for path in (runtime_dir / _SESSION_FILENAME, bw_state_dir(runtime_dir)):
         try:
             if path.is_dir() and not path.is_symlink():
                 shutil.rmtree(path)
