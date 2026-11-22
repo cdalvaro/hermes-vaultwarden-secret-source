@@ -13,16 +13,18 @@ DEFAULT_SESSION_ENV = "BW_SESSION"
 
 
 def item_ids(cfg: dict) -> Optional[list[str]]:
+    """Canonical (lowercase, hyphenated) item UUIDs. bw only looks an item up by
+    id when the argument matches its GUID pattern; anything else becomes a
+    text search over item names, so never pass the user's spelling through."""
     configured_item_ids = (cfg or {}).get("item_ids")
-    if not isinstance(configured_item_ids, list):
+    if not isinstance(configured_item_ids, list) or not configured_item_ids:
         return None
-    ids = [
-        item_id.strip() for item_id in configured_item_ids if isinstance(item_id, str)
-    ]
-    if len(ids) != len(configured_item_ids):
-        return None
-    if not ids or len(set(ids)) != len(ids) or not all(is_uuid(i) for i in ids):
-        return None
+    ids: list[str] = []
+    for configured in configured_item_ids:
+        canonical = canonical_uuid(configured)
+        if canonical is None or canonical in ids:
+            return None
+        ids.append(canonical)
     return ids
 
 
@@ -30,9 +32,10 @@ def session_env(cfg: dict) -> str:
     return str((cfg or {}).get("session_env") or DEFAULT_SESSION_ENV)
 
 
-def is_uuid(value: str) -> bool:
+def canonical_uuid(value: object) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
     try:
-        uuid.UUID(value)
-    except (TypeError, ValueError, AttributeError):
-        return False
-    return True
+        return str(uuid.UUID(value.strip()))
+    except ValueError:
+        return None

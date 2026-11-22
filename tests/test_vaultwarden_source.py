@@ -78,12 +78,6 @@ class TestVaultwardenSource:
                 stdout="https://vaultwarden.example.test\n",
                 stderr="",
             ),
-            subprocess.CompletedProcess(
-                args=[],
-                returncode=0,
-                stdout=json.dumps({"status": "unauthenticated"}),
-                stderr="",
-            ),
             subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
             subprocess.CompletedProcess(
                 args=[], returncode=0, stdout=session, stderr=""
@@ -130,8 +124,8 @@ class TestVaultwardenSource:
         result = self.source.fetch(cfg, self.home)
 
         assert result.secrets == {}
-        login_env = run_cli.call_args_list[3].kwargs["extra_env"]
-        unlock_env = run_cli.call_args_list[4].kwargs["extra_env"]
+        login_env = run_cli.call_args_list[2].kwargs["extra_env"]
+        unlock_env = run_cli.call_args_list[3].kwargs["extra_env"]
         assert login_env["BW_CLIENTID"] == "literal-client-id"
         assert login_env["BW_CLIENTSECRET"] == "literal-client-secret"
         assert unlock_env["BW_PASSWORD"] == "literal-master-password"
@@ -153,7 +147,7 @@ class TestVaultwardenSource:
         result = self.source.fetch(cfg, self.home)
 
         assert result.secrets == {}
-        login_env = run_cli.call_args_list[3].kwargs["extra_env"]
+        login_env = run_cli.call_args_list[2].kwargs["extra_env"]
         assert login_env["BW_CLIENTID"] == "literal-client-id"
         assert login_env["BW_CLIENTSECRET"] == "client-secret"
 
@@ -181,7 +175,7 @@ class TestVaultwardenSource:
     ) -> None:
         calls: list[list[str]] = []
 
-        def fake_run(command, *, extra_env, timeout):
+        def fake_run(command, *, extra_env, timeout, **_kwargs):
             args = command[1:]
             calls.append(args)
             if args == ["config", "server", "https://vaultwarden.example.test"]:
@@ -208,108 +202,10 @@ class TestVaultwardenSource:
             ["config", "server"],
         ]
 
-    @patch.object(vw, "find_bw", return_value=Path("/usr/local/bin/bw"))
-    @patch.object(vw, "run_secret_cli")
-    def test_locked_cli_state_unlocks_without_reauthenticating(
-        self, run_cli, _find_bw
-    ) -> None:
-        calls: list[list[str]] = []
-
-        def fake_run(command, *, extra_env, timeout):
-            args = command[1:]
-            calls.append(args)
-            if args == ["config", "server", "https://vaultwarden.example.test"]:
-                return subprocess.CompletedProcess(
-                    args=[], returncode=0, stdout="", stderr=""
-                )
-            if args == ["config", "server"]:
-                return subprocess.CompletedProcess(
-                    args=[],
-                    returncode=0,
-                    stdout="https://vaultwarden.example.test\n",
-                    stderr="",
-                )
-            if args == ["status", "--raw"]:
-                return subprocess.CompletedProcess(
-                    args=[],
-                    returncode=0,
-                    stdout=json.dumps({"status": "locked"}),
-                    stderr="",
-                )
-            if args == ["unlock", "--passwordenv", "BW_PASSWORD", "--raw"]:
-                return subprocess.CompletedProcess(
-                    args=[], returncode=0, stdout="session", stderr=""
-                )
-            if args == ["sync"]:
-                return subprocess.CompletedProcess(
-                    args=[], returncode=0, stdout="", stderr=""
-                )
-            if args == ["get", "item", self.item_id]:
-                return subprocess.CompletedProcess(
-                    args=[], returncode=0, stdout=json.dumps({"fields": []}), stderr=""
-                )
-            pytest.fail(f"Unexpected bw invocation: {args}")
-
-        run_cli.side_effect = fake_run
-        result = self.source.fetch(self.bootstrap_cfg(), self.home)
-
-        assert result.secrets == {}
-        assert ["login", "--apikey"] not in calls
-        assert calls == [
-            ["config", "server", "https://vaultwarden.example.test"],
-            ["config", "server"],
-            ["status", "--raw"],
-            ["unlock", "--passwordenv", "BW_PASSWORD", "--raw"],
-            ["sync"],
-            ["get", "item", self.item_id],
-        ]
-
-    @patch.object(vw, "_MAX_ATTEMPTS", 1)
-    @patch.object(vw, "find_bw", return_value=Path("/usr/local/bin/bw"))
-    @patch.object(vw, "run_secret_cli")
-    def test_unexpected_cli_state_fails_closed_without_sending_credentials(
-        self, run_cli, _find_bw
-    ) -> None:
-        calls: list[list[str]] = []
-
-        def fake_run(command, *, extra_env, timeout):
-            args = command[1:]
-            calls.append(args)
-            if args == ["config", "server", "https://vaultwarden.example.test"]:
-                return subprocess.CompletedProcess(
-                    args=[], returncode=0, stdout="", stderr=""
-                )
-            if args == ["config", "server"]:
-                return subprocess.CompletedProcess(
-                    args=[],
-                    returncode=0,
-                    stdout="https://vaultwarden.example.test\n",
-                    stderr="",
-                )
-            if args == ["status", "--raw"]:
-                return subprocess.CompletedProcess(
-                    args=[],
-                    returncode=0,
-                    stdout=json.dumps({"status": "unlocked"}),
-                    stderr="",
-                )
-            pytest.fail(
-                "Bootstrap credentials must not be sent for an unexpected CLI state"
-            )
-
-        run_cli.side_effect = fake_run
-        result = self.source.fetch(self.bootstrap_cfg(), self.home)
-
-        assert result.error_kind == ErrorKind.AUTH_FAILED
-        assert calls == [
-            ["config", "server", "https://vaultwarden.example.test"],
-            ["config", "server"],
-            ["status", "--raw"],
-        ]
-
     def test_protects_session_and_bootstrap_environment_names(self) -> None:
         assert self.source.protected_env_vars({}) == frozenset(
             {"BW_SESSION", "BW_CLIENTID", "BW_CLIENTSECRET", "BW_PASSWORD"}
+            | set(vw._BW_PASSTHROUGH_ENV)
         )
 
     @patch.object(vw, "find_bw", return_value=Path("/usr/local/bin/bw"))
@@ -374,7 +270,7 @@ class TestVaultwardenSource:
 
         assert result.error_kind == ErrorKind.NETWORK
         assert sleep.call_count == vw._MAX_ATTEMPTS - 1
-        assert run_cli.call_count == 5 + vw._MAX_ATTEMPTS
+        assert run_cli.call_count == 4 + vw._MAX_ATTEMPTS
 
     @patch.object(vw.time, "sleep")
     def test_configuration_errors_are_not_retried(self, sleep) -> None:
@@ -429,7 +325,6 @@ class TestVaultwardenSource:
         assert [call.args[0][1:] for call in run_cli.call_args_list] == [
             ["config", "server", "https://vaultwarden.example.test"],
             ["config", "server"],
-            ["status", "--raw"],
             ["login", "--apikey"],
             ["unlock", "--passwordenv", "BW_PASSWORD", "--raw"],
             ["sync"],
@@ -544,7 +439,6 @@ class TestVaultwardenSource:
         assert [call.args[0][1:] for call in run_cli.call_args_list] == [
             ["config", "server", "https://vaultwarden.example.test"],
             ["config", "server"],
-            ["status", "--raw"],
             ["login", "--apikey"],
             ["unlock", "--passwordenv", "BW_PASSWORD", "--raw"],
             ["sync"],
@@ -553,7 +447,6 @@ class TestVaultwardenSource:
         (
             config_env,
             observed_server_env,
-            status_env,
             login_env,
             unlock_env,
             sync_env,
@@ -564,7 +457,6 @@ class TestVaultwardenSource:
             for env in (
                 config_env,
                 observed_server_env,
-                status_env,
                 login_env,
                 unlock_env,
                 sync_env,
@@ -584,7 +476,7 @@ class TestVaultwardenSource:
 
     @patch.object(vw, "find_bw", return_value=Path("/usr/local/bin/bw"))
     @patch.object(vw, "run_secret_cli")
-    @patch.object(vw.time, "monotonic", side_effect=range(8))
+    @patch.object(vw.time, "monotonic", side_effect=range(7))
     def test_uses_one_declining_deadline_for_the_full_fetch(
         self, _clock, run_cli, _find_bw
     ) -> None:
@@ -608,7 +500,6 @@ class TestVaultwardenSource:
             26,
             25,
             24,
-            23,
         ]
 
     @patch.object(vw, "find_bw", return_value=Path("/usr/local/bin/bw"))
@@ -635,7 +526,6 @@ class TestVaultwardenSource:
         assert [call.args[0][1] for call in run_cli.call_args_list] == [
             "config",
             "config",
-            "status",
             "login",
             "unlock",
             "sync",
@@ -681,7 +571,7 @@ class TestVaultwardenSource:
         calls: list[str] = []
         calls_lock = threading.Lock()
 
-        def fake_run(command, *, extra_env, timeout):
+        def fake_run(command, *, extra_env, timeout, **_kwargs):
             args = command[1:]
             action = args[0]
             with calls_lock:
@@ -696,13 +586,6 @@ class TestVaultwardenSource:
                     args=[],
                     returncode=0,
                     stdout="https://vaultwarden.example.test\n",
-                    stderr="",
-                )
-            if args == ["status", "--raw"]:
-                return subprocess.CompletedProcess(
-                    args=[],
-                    returncode=0,
-                    stdout=json.dumps({"status": "unauthenticated"}),
                     stderr="",
                 )
             if action == "unlock":
@@ -778,7 +661,6 @@ class TestVaultwardenSource:
         assert [call.args[0][1] for call in run_cli.call_args_list] == [
             "config",
             "config",
-            "status",
             "login",
             "unlock",
             "sync",

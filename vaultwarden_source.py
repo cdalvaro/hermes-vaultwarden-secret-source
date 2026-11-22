@@ -2,14 +2,15 @@
 
 The source uses a container-local runtime directory to share one Bitwarden CLI
 login among Hermes processes in the same task. The directory is created below
-``/tmp`` with restrictive permissions, never in the shared Hermes volume, and
-is discarded when the container is replaced or rescheduled.
+the system temporary directory with restrictive permissions, never in the
+shared Hermes volume, and is discarded when the container is replaced or rescheduled.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -20,6 +21,8 @@ from agent.secret_sources.base import (
     ErrorKind,
     FetchResult,
     SecretSource,
+    classify_cli_error,
+    get_source_environment,
     is_valid_env_name,
     run_secret_cli,
 )
@@ -38,6 +41,9 @@ try:
     )
     from ._runtime import (
         acquire_runtime_lock as _acquire_runtime_lock,
+    )
+    from ._runtime import (
+        bw_state_dir as _bw_state_dir,
     )
     from ._runtime import (
         invalidate_runtime_bootstrap as _invalidate_runtime_bootstrap,
@@ -73,6 +79,9 @@ except ImportError:
         acquire_runtime_lock as _acquire_runtime_lock,
     )
     from _runtime import (
+        bw_state_dir as _bw_state_dir,
+    )
+    from _runtime import (
         invalidate_runtime_bootstrap as _invalidate_runtime_bootstrap,
     )
     from _runtime import (
@@ -96,20 +105,41 @@ _DEFAULT_TIMEOUT_SECONDS = 90.0
 # single fetch deadline, so a real outage still ends within timeout_seconds.
 _MAX_ATTEMPTS = 3
 _RETRY_DELAY_SECONDS = 5.0
+# Every bootstrap step reports its own classified error, so AUTH_FAILED really
+# means rejected credentials (a restarting server surfaces as NETWORK or
+# INTERNAL) and retrying it would only repeat the rejected login.
 _PERMANENT_ERRORS = frozenset(
-    {ErrorKind.NOT_CONFIGURED, ErrorKind.BINARY_MISSING, ErrorKind.REF_INVALID}
+    {
+        ErrorKind.NOT_CONFIGURED,
+        ErrorKind.BINARY_MISSING,
+        ErrorKind.REF_INVALID,
+        ErrorKind.AUTH_FAILED,
+    }
 )
 _DEFAULT_RUNTIME_DIR = Path(tempfile.gettempdir()) / "hermes-vaultwarden"
 _BOOTSTRAP_ENV_NAMES = frozenset({"BW_CLIENTID", "BW_CLIENTSECRET", "BW_PASSWORD"})
 _HIDDEN_FIELD_TYPE = 1  # bw's `fields[].type`: 0 text, 1 hidden, 2 boolean, 3 linked
 _FILE_SCHEME_PREFIX = "file://"
+_ENV_SCHEME_PREFIX = "env:"
+_BOOTSTRAP_KEYS = ("client_id", "client_secret", "master_password")
+# bw is a Node program: it trusts a private CA only through NODE_EXTRA_CA_CERTS
+# (it ignores SSL_CERT_FILE) and reads lowercase proxy variables.
+_BW_PASSTHROUGH_ENV = (
+    "NODE_EXTRA_CA_CERTS",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+)
 _BOOTSTRAP_VALUE_DESCRIPTION = (
-    "the literal value, or a `file:///absolute/path` Docker secret"
+    "a `file:///absolute/path` secret file, `env:NAME`, or the literal value"
 )
 
 _SETUP_HINT = (
-    "Check client_id, client_secret, master_password (each either the literal "
-    "value or a file:///absolute/path) and server_url under secrets.vaultwarden "
+    "Check client_id, client_secret, master_password (each a file:///absolute/path, "
+    "env:NAME or the literal value) and server_url under secrets.vaultwarden "
     "in your Hermes config; see this plugin's README for the expected layout."
 )
 _REMEDIATION_HINTS = {
@@ -136,8 +166,17 @@ class VaultwardenSource(SecretSource):
         return bool(isinstance(cfg, dict) and cfg.get("override_existing", True))
 
     def protected_env_vars(self, cfg: dict):
-        """Never let vault fields replace session or bootstrap credentials."""
-        return frozenset({_session_env(cfg), *_BOOTSTRAP_ENV_NAMES})
+        """Never let vault fields replace session or bootstrap credentials,
+        the variables that ``env:NAME`` bootstrap values read, or the CA and
+        proxy settings that decide how bw reaches the vault."""
+        return frozenset(
+            {
+                _session_env(cfg),
+                *_BOOTSTRAP_ENV_NAMES,
+                *_BW_PASSTHROUGH_ENV,
+                *_bootstrap_env_refs(cfg),
+            }
+        )
 
     def fetch_timeout_seconds(self, cfg: dict) -> float:
         try:
@@ -158,7 +197,7 @@ class VaultwardenSource(SecretSource):
                 "description": "Ordered UUIDs of Vaultwarden items whose custom fields hold secrets",
             },
             "session_env": {
-                "description": "Reserved legacy session variable; never loaded from Vaultwarden",
+                "description": "Legacy: an extra variable name protected from Vaultwarden; bw always receives BW_SESSION",
                 "default": DEFAULT_SESSION_ENV,
             },
             "binary": {
@@ -196,9 +235,10 @@ class VaultwardenSource(SecretSource):
         }
 
     def fetch(self, cfg: dict, home_path: Path) -> FetchResult:
-        """Fetch with a short retry: Hermes reads the vault once per process,
-        so a Vaultwarden that is still restarting would otherwise leave the
-        process without secrets until it is restarted."""
+        """Fetch with a short retry: Hermes reads the vault when a process
+        starts (and only on some later re-reads, such as cron runs), so a
+        Vaultwarden that is still restarting would otherwise leave the process
+        without secrets until the next read."""
         cfg = cfg if isinstance(cfg, dict) else {}
         deadline = time.monotonic() + self.fetch_timeout_seconds(cfg)
         attempt = 1
@@ -220,6 +260,16 @@ class VaultwardenSource(SecretSource):
         session_env = _session_env(cfg)
         if not is_valid_env_name(session_env):
             result.error = "secrets.vaultwarden.session_env is not a valid environment variable name"
+            result.error_kind = ErrorKind.NOT_CONFIGURED
+            return result
+
+        placeholder = _unexpanded_placeholder(cfg)
+        if placeholder:
+            result.error = (
+                f"secrets.vaultwarden.{placeholder} looks like an unexpanded ${{...}} "
+                "placeholder; Hermes does not expand the secrets: section. "
+                "Use env:NAME or file:///path instead."
+            )
             result.error_kind = ErrorKind.NOT_CONFIGURED
             return result
 
@@ -250,18 +300,14 @@ class VaultwardenSource(SecretSource):
             result.error_kind = ErrorKind.TIMEOUT
             return result
         try:
-            bootstrapped = self._bootstrap_if_needed(
-                binary, cfg, session_env, runtime_dir, deadline
-            )
-            if bootstrapped is None:
+            bootstrapped = self._bootstrap_if_needed(binary, cfg, runtime_dir, deadline)
+            if isinstance(bootstrapped, ErrorKind):
                 result.error = "Vaultwarden bootstrap authentication is unavailable"
-                result.error_kind = _bootstrap_error_kind(cfg, deadline)
+                result.error_kind = bootstrapped
                 return result
             session, session_extra_env = bootstrapped
 
-            synced = _run_bw(
-                binary, ["sync"], session_env, session, session_extra_env, deadline
-            )
+            synced = _run_bw(binary, ["sync"], session, session_extra_env, deadline)
             if synced is None or synced.returncode != 0:
                 error_kind = _error_kind(synced, deadline)
                 if error_kind not in (ErrorKind.AUTH_EXPIRED, ErrorKind.AUTH_FAILED):
@@ -271,18 +317,19 @@ class VaultwardenSource(SecretSource):
                     result.error_kind = error_kind
                     return result
                 self._clear_bootstrap()
-                _invalidate_runtime_bootstrap(runtime_dir)
+                # Under the lock: if another process already replaced the shared
+                # session, adopt it; only a still-current stale one is discarded.
+                if _read_runtime_session(runtime_dir) == session:
+                    _invalidate_runtime_bootstrap(runtime_dir)
                 bootstrapped = self._bootstrap_if_needed(
-                    binary, cfg, session_env, runtime_dir, deadline
+                    binary, cfg, runtime_dir, deadline
                 )
-                if bootstrapped is None:
+                if isinstance(bootstrapped, ErrorKind):
                     result.error = "Vaultwarden bootstrap authentication is unavailable"
-                    result.error_kind = _bootstrap_error_kind(cfg, deadline)
+                    result.error_kind = bootstrapped
                     return result
                 session, session_extra_env = bootstrapped
-                synced = _run_bw(
-                    binary, ["sync"], session_env, session, session_extra_env, deadline
-                )
+                synced = _run_bw(binary, ["sync"], session, session_extra_env, deadline)
                 if synced is None or synced.returncode != 0:
                     result.error = (
                         "bw could not synchronize the configured Vaultwarden vault"
@@ -292,12 +339,7 @@ class VaultwardenSource(SecretSource):
 
             for item_id in item_ids:
                 completed = _run_bw(
-                    binary,
-                    ["get", "item", item_id],
-                    session_env,
-                    session,
-                    session_extra_env,
-                    deadline,
+                    binary, ["get", "item", item_id], session, session_extra_env, deadline
                 )
                 if completed is None or completed.returncode != 0:
                     result.warnings.append(
@@ -355,13 +397,8 @@ class VaultwardenSource(SecretSource):
         return result
 
     def _bootstrap_if_needed(
-        self,
-        binary: Path,
-        cfg: dict,
-        session_env: str,
-        runtime_dir: Path,
-        deadline: float,
-    ) -> Optional[tuple[str, dict[str, str]]]:
+        self, binary: Path, cfg: dict, runtime_dir: Path, deadline: float
+    ) -> tuple[str, dict[str, str]] | ErrorKind:
         if self._bootstrap_session:
             return self._bootstrap_session, self._bootstrap_env
         runtime_env = _runtime_env_for(runtime_dir)
@@ -370,74 +407,55 @@ class VaultwardenSource(SecretSource):
             self._bootstrap_session = session
             self._bootstrap_env = runtime_env
             return session, runtime_env
-        return self._bootstrap(binary, cfg, session_env, runtime_dir, deadline)
+        return self._bootstrap(binary, cfg, runtime_dir, deadline)
 
     def _bootstrap(
-        self,
-        binary: Path,
-        cfg: dict,
-        session_env: str,
-        runtime_dir: Path,
-        deadline: float,
-    ) -> Optional[tuple[str, dict[str, str]]]:
+        self, binary: Path, cfg: dict, runtime_dir: Path, deadline: float
+    ) -> tuple[str, dict[str, str]] | ErrorKind:
+        """Log in and unlock from a clean slate. Starting from nothing every
+        time keeps any earlier failure (wrong password, timeout, a process
+        killed mid-login) from leaving bw state that blocks the next attempt."""
         credentials = _read_bootstrap_credentials(cfg)
         server_url = str(cfg.get("server_url") or "").strip()
         if credentials is None or not server_url.startswith("https://"):
-            return None
+            return ErrorKind.NOT_CONFIGURED
 
+        _invalidate_runtime_bootstrap(runtime_dir)
         runtime_env = _runtime_env_for(runtime_dir)
-        configured = _run_bootstrap_cli(
+        configured = _run_cli(
             binary, ["config", "server", server_url], runtime_env, deadline
         )
         if configured is None or configured.returncode != 0:
-            _invalidate_runtime_bootstrap(runtime_dir)
-            return None
-        observed_server = _run_bootstrap_cli(
-            binary, ["config", "server"], runtime_env, deadline
+            return _error_kind(configured, deadline)
+        observed_server = _run_cli(binary, ["config", "server"], runtime_env, deadline)
+        if observed_server is None or observed_server.returncode != 0:
+            return _error_kind(observed_server, deadline)
+        if not _same_server_url(observed_server.stdout, server_url):
+            # Never send the API key to a server we did not configure.
+            return ErrorKind.AUTH_FAILED
+        logged_in = _run_cli(
+            binary,
+            ["login", "--apikey"],
+            {
+                **runtime_env,
+                "BW_CLIENTID": credentials["client_id"],
+                "BW_CLIENTSECRET": credentials["client_secret"],
+            },
+            deadline,
         )
-        if (
-            observed_server is None
-            or observed_server.returncode != 0
-            or not _same_server_url(observed_server.stdout, server_url)
-        ):
-            _invalidate_runtime_bootstrap(runtime_dir)
-            return None
-        status = _run_bootstrap_cli(binary, ["status", "--raw"], runtime_env, deadline)
-        if status is None or status.returncode != 0:
-            _invalidate_runtime_bootstrap(runtime_dir)
-            return None
-        state = _bw_status(status.stdout)
-        if state == "unauthenticated":
-            logged_in = _run_bootstrap_cli(
-                binary,
-                ["login", "--apikey"],
-                {
-                    **runtime_env,
-                    "BW_CLIENTID": credentials["client_id"],
-                    "BW_CLIENTSECRET": credentials["client_secret"],
-                },
-                deadline,
-            )
-            if logged_in is None or logged_in.returncode != 0:
-                _invalidate_runtime_bootstrap(runtime_dir)
-                return None
-            state = "locked"
-        if state != "locked":
-            _invalidate_runtime_bootstrap(runtime_dir)
-            return None
-        unlocked = _run_bootstrap_cli(
+        if logged_in is None or logged_in.returncode != 0:
+            return _error_kind(logged_in, deadline)
+        unlocked = _run_cli(
             binary,
             ["unlock", "--passwordenv", "BW_PASSWORD", "--raw"],
             {**runtime_env, "BW_PASSWORD": credentials["password"]},
             deadline,
         )
         if unlocked is None or unlocked.returncode != 0:
-            _invalidate_runtime_bootstrap(runtime_dir)
-            return None
+            return _error_kind(unlocked, deadline)
         session = unlocked.stdout.strip()
         if not session or not _write_runtime_session(runtime_dir, session):
-            _invalidate_runtime_bootstrap(runtime_dir)
-            return None
+            return ErrorKind.INTERNAL
         self._bootstrap_session = session
         self._bootstrap_env = runtime_env
         return session, runtime_env
@@ -461,7 +479,7 @@ def _runtime_env_for(runtime_dir: Path) -> dict[str, str]:
         "HOME": str(runtime_dir),
         "XDG_CONFIG_HOME": str(runtime_dir),
         "XDG_DATA_HOME": str(runtime_dir),
-        "BITWARDENCLI_APPDATA_DIR": str(runtime_dir / ".bitwarden"),
+        "BITWARDENCLI_APPDATA_DIR": str(_bw_state_dir(runtime_dir)),
     }
 
 
@@ -487,18 +505,13 @@ def find_bw(home_path: Path, configured_binary: str = "") -> Optional[Path]:
 def _run_bw(
     binary: Path,
     args: list[str],
-    session_env: str,
     session: str,
     extra_env: dict[str, str],
     deadline: float,
 ):
-    return _run_cli(binary, args, {**extra_env, session_env: session}, deadline)
-
-
-def _run_bootstrap_cli(
-    binary: Path, args: list[str], extra_env: dict[str, str], deadline: float
-):
-    return _run_cli(binary, args, extra_env, deadline)
+    # bw only reads BW_SESSION; the child env is built from scratch, so there is
+    # no name to collide with whatever session_env is configured.
+    return _run_cli(binary, args, {**extra_env, "BW_SESSION": session}, deadline)
 
 
 def _run_cli(binary: Path, args: list[str], extra_env: dict[str, str], deadline: float):
@@ -507,7 +520,10 @@ def _run_cli(binary: Path, args: list[str], extra_env: dict[str, str], deadline:
         return None
     try:
         return run_secret_cli(
-            [str(binary), *args], extra_env=extra_env, timeout=remaining
+            [str(binary), *args],
+            allow_env=_BW_PASSTHROUGH_ENV,
+            extra_env=extra_env,
+            timeout=remaining,
         )
     except RuntimeError:
         return None
@@ -517,25 +533,18 @@ def _same_server_url(observed: str, configured: str) -> bool:
     return observed.strip().rstrip("/") == configured.rstrip("/")
 
 
-def _bw_status(output: str) -> str:
-    try:
-        payload = json.loads(output)
-    except (TypeError, json.JSONDecodeError):
-        return str(output or "").strip().lower()
-    return (
-        str(payload.get("status") or "").strip().lower()
-        if isinstance(payload, dict)
-        else ""
-    )
-
-
 def _resolve_bootstrap_value(raw: str) -> Optional[str]:
-    """Resolve one bootstrap credential: a ``file:///absolute/path`` value
-    names a Docker secret file to read; any other value is the literal
-    credential itself."""
+    """Resolve one bootstrap credential: ``file:///absolute/path`` reads a
+    secret file, ``env:NAME`` reads this fetch's environment (``.env``
+    included), and any other value is the literal credential itself."""
     raw = raw.strip()
     if not raw:
         return None
+    if raw.startswith(_ENV_SCHEME_PREFIX):
+        name = raw[len(_ENV_SCHEME_PREFIX):].strip()
+        if not is_valid_env_name(name):
+            return None
+        return get_source_environment().get(name, "").strip() or None
     if not raw.startswith(_FILE_SCHEME_PREFIX):
         return raw
     path = Path(raw[len(_FILE_SCHEME_PREFIX):])
@@ -563,24 +572,34 @@ def _read_bootstrap_credentials(cfg: dict) -> Optional[dict[str, str]]:
     return credentials
 
 
-def _bootstrap_is_configured(cfg: dict) -> bool:
-    return _read_bootstrap_credentials(cfg) is not None
+def _bootstrap_env_refs(cfg: dict) -> set[str]:
+    refs = set()
+    for key in _BOOTSTRAP_KEYS:
+        raw = str((cfg or {}).get(key) or "").strip()
+        if raw.startswith(_ENV_SCHEME_PREFIX):
+            name = raw[len(_ENV_SCHEME_PREFIX):].strip()
+            if is_valid_env_name(name):
+                refs.add(name)
+    return refs
 
 
-def _bootstrap_error_kind(cfg: dict, deadline: float) -> ErrorKind:
-    if _remaining_seconds(deadline) is None:
-        return ErrorKind.TIMEOUT
-    return (
-        ErrorKind.AUTH_FAILED
-        if _bootstrap_is_configured(cfg)
-        else ErrorKind.NOT_CONFIGURED
-    )
+# Only a whole ``${NAME}`` / ``${env:NAME}`` value, the shape Hermes uses: a
+# random literal password may well contain "${" somewhere.
+_PLACEHOLDER_RE = re.compile(r"\$\{\s*(?:env:)?\s*[A-Za-z_][A-Za-z0-9_]*\s*\}")
+
+
+def _unexpanded_placeholder(cfg: dict) -> Optional[str]:
+    """Hermes passes the secrets: section verbatim, so a ``${VAR}`` would
+    otherwise be sent to Vaultwarden as the literal credential."""
+    for key in ("server_url", *_BOOTSTRAP_KEYS):
+        if _PLACEHOLDER_RE.fullmatch(str((cfg or {}).get(key) or "").strip()):
+            return key
+    return None
 
 
 def _is_transient(result: FetchResult) -> bool:
-    """Worth retrying: any error but a configuration one (a restarting server
-    also looks like AUTH_FAILED to the bootstrap), or no secrets at all because
-    every item read failed."""
+    """Worth retrying: any error but a permanent one, or no secrets at all
+    because every item read failed."""
     if result.error:
         return result.error_kind not in _PERMANENT_ERRORS
     return not result.secrets and bool(result.warnings)
@@ -592,28 +611,50 @@ def _error_kind(result, deadline: float) -> ErrorKind:
     return _classify_error(result.stderr if result is not None else "")
 
 
+# First match wins. Network failures are checked before credential ones so a
+# stray "401" inside an address or port never turns an outage into a
+# (non-retried) AUTH_FAILED.
+_ERROR_RULES = (
+    (
+        ErrorKind.AUTH_EXPIRED,
+        ("session expired", "vault is locked", "not logged in", "invalid session"),
+    ),
+    (
+        ErrorKind.NETWORK,
+        (
+            "network",
+            "connection",
+            "resolve",
+            "dns",
+            "server unavailable",
+            "econnrefused",
+            "econnreset",
+            "enotfound",
+            "etimedout",
+            "socket hang up",
+            "fetch failed",
+        ),
+    ),
+    (
+        ErrorKind.AUTH_FAILED,
+        (
+            "unauthorized",
+            "forbidden",
+            "invalid password",
+            "invalid master password",
+            "decryption operation failed",  # bw 2026.x on a wrong master password
+            # Vaultwarden's API-key login rejections (src/api/identity.rs)
+            "incorrect client_secret",
+            "invalid client_id",
+            "malformed client_id",
+            "user has been disabled",
+            "401",
+            "403",
+        ),
+    ),
+    (ErrorKind.TIMEOUT, ("timed out",)),
+)
+
+
 def _classify_error(message: str) -> ErrorKind:
-    lowered = (message or "").lower()
-    if any(
-        token in lowered
-        for token in (
-            "session expired",
-            "vault is locked",
-            "not logged in",
-            "invalid session",
-        )
-    ):
-        return ErrorKind.AUTH_EXPIRED
-    if any(
-        token in lowered
-        for token in ("unauthorized", "forbidden", "invalid password", "401", "403")
-    ):
-        return ErrorKind.AUTH_FAILED
-    if any(
-        token in lowered
-        for token in ("network", "connection", "resolve", "dns", "server unavailable")
-    ):
-        return ErrorKind.NETWORK
-    if "timed out" in lowered:
-        return ErrorKind.TIMEOUT
-    return ErrorKind.INTERNAL
+    return classify_cli_error(message or "", _ERROR_RULES)
