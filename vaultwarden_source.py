@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -166,9 +167,15 @@ class VaultwardenSource(SecretSource):
 
     def protected_env_vars(self, cfg: dict):
         """Never let vault fields replace session or bootstrap credentials,
-        including the variables that ``env:NAME`` bootstrap values read."""
+        the variables that ``env:NAME`` bootstrap values read, or the CA and
+        proxy settings that decide how bw reaches the vault."""
         return frozenset(
-            {_session_env(cfg), *_BOOTSTRAP_ENV_NAMES, *_bootstrap_env_refs(cfg)}
+            {
+                _session_env(cfg),
+                *_BOOTSTRAP_ENV_NAMES,
+                *_BW_PASSTHROUGH_ENV,
+                *_bootstrap_env_refs(cfg),
+            }
         )
 
     def fetch_timeout_seconds(self, cfg: dict) -> float:
@@ -228,9 +235,10 @@ class VaultwardenSource(SecretSource):
         }
 
     def fetch(self, cfg: dict, home_path: Path) -> FetchResult:
-        """Fetch with a short retry: Hermes reads the vault once per process,
-        so a Vaultwarden that is still restarting would otherwise leave the
-        process without secrets until it is restarted."""
+        """Fetch with a short retry: Hermes reads the vault when a process
+        starts (and only on some later re-reads, such as cron runs), so a
+        Vaultwarden that is still restarting would otherwise leave the process
+        without secrets until the next read."""
         cfg = cfg if isinstance(cfg, dict) else {}
         deadline = time.monotonic() + self.fetch_timeout_seconds(cfg)
         attempt = 1
@@ -575,11 +583,16 @@ def _bootstrap_env_refs(cfg: dict) -> set[str]:
     return refs
 
 
+# Only a whole ``${NAME}`` / ``${env:NAME}`` value, the shape Hermes uses: a
+# random literal password may well contain "${" somewhere.
+_PLACEHOLDER_RE = re.compile(r"\$\{\s*(?:env:)?\s*[A-Za-z_][A-Za-z0-9_]*\s*\}")
+
+
 def _unexpanded_placeholder(cfg: dict) -> Optional[str]:
     """Hermes passes the secrets: section verbatim, so a ``${VAR}`` would
     otherwise be sent to Vaultwarden as the literal credential."""
-    for key in _BOOTSTRAP_KEYS:
-        if "${" in str((cfg or {}).get(key) or ""):
+    for key in ("server_url", *_BOOTSTRAP_KEYS):
+        if _PLACEHOLDER_RE.fullmatch(str((cfg or {}).get(key) or "").strip()):
             return key
     return None
 
@@ -630,7 +643,11 @@ _ERROR_RULES = (
             "invalid password",
             "invalid master password",
             "decryption operation failed",  # bw 2026.x on a wrong master password
-            "is incorrect",
+            # Vaultwarden's API-key login rejections (src/api/identity.rs)
+            "incorrect client_secret",
+            "invalid client_id",
+            "malformed client_id",
+            "user has been disabled",
             "401",
             "403",
         ),

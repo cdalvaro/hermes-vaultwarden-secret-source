@@ -205,6 +205,7 @@ class TestVaultwardenSource:
     def test_protects_session_and_bootstrap_environment_names(self) -> None:
         assert self.source.protected_env_vars({}) == frozenset(
             {"BW_SESSION", "BW_CLIENTID", "BW_CLIENTSECRET", "BW_PASSWORD"}
+            | set(vw._BW_PASSTHROUGH_ENV)
         )
 
     @patch.object(vw, "find_bw", return_value=Path("/usr/local/bin/bw"))

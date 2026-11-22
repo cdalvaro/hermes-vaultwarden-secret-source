@@ -21,7 +21,11 @@ import pytest
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PLUGIN_DIR))
 
-from agent.secret_sources.base import ErrorKind  # noqa: E402
+from agent.secret_sources.base import (  # noqa: E402
+    ErrorKind,
+    reset_source_environment,
+    set_source_environment,
+)
 
 import vaultwarden_source as vw  # noqa: E402
 
@@ -149,17 +153,59 @@ def test_unexpanded_placeholder_is_rejected_before_running_bw(task, tmp_path):
     result = fetch(task.cfg(master_password="${HERMES_VW_PASSWORD}"), tmp_path)
 
     assert result.error_kind == ErrorKind.NOT_CONFIGURED
-    assert "master_password" in result.error and "env:NAME" in result.error
+    assert "master_password" in (result.error or "")
+    assert "env:NAME" in (result.error or "")
     assert task.calls() == []
 
 
-def test_env_reference_reads_the_fetch_environment_and_is_protected(task, tmp_path):
+def test_env_reference_reads_the_fetch_environment_and_is_protected(
+    task, tmp_path, monkeypatch
+):
+    monkeypatch.delenv("HERMES_VW_PASSWORD", raising=False)
     cfg = task.cfg(master_password="env:HERMES_VW_PASSWORD")
-    with patch.dict(os.environ, {"HERMES_VW_PASSWORD": "master-password"}):
+    token = set_source_environment({"HERMES_VW_PASSWORD": "master-password"})
+    try:
         result = fetch(cfg, tmp_path)
+    finally:
+        reset_source_environment(token)
 
     assert result.secrets == {"OPENAI_API_KEY": "sk-vault"}
     assert "HERMES_VW_PASSWORD" in vw.VaultwardenSource().protected_env_vars(cfg)
+
+
+def test_a_literal_password_containing_dollar_brace_is_accepted(task, tmp_path):
+    password = "Tr0ub4dor&${x9"
+    task.spec(credentials={**CREDENTIALS, "master_password": password})
+
+    result = fetch(task.cfg(master_password=password), tmp_path)
+
+    assert result.secrets == {"OPENAI_API_KEY": "sk-vault"}
+
+
+def test_unexpanded_server_url_placeholder_is_named_in_the_error(task, tmp_path):
+    result = fetch(task.cfg(server_url="${VW_URL}"), tmp_path)
+
+    assert result.error_kind == ErrorKind.NOT_CONFIGURED
+    assert "server_url" in (result.error or "")
+    assert task.calls() == []
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Incorrect client_secret",
+        "Invalid client_id",
+        "Malformed client_id",
+        "This user has been disabled (API key login)",
+    ],
+)
+def test_a_rejected_api_key_is_auth_failed_and_not_retried(task, tmp_path, message):
+    task.spec(login_error=message)
+
+    result = fetch(task.cfg(), tmp_path)
+
+    assert result.error_kind == ErrorKind.AUTH_FAILED
+    assert task.logins() == 1
 
 
 def test_custom_session_env_still_reaches_bw_as_bw_session(task, tmp_path):

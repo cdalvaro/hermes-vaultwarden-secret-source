@@ -24,7 +24,10 @@ It does not use the `bws` CLI for Bitwarden Secrets Manager.
   and adopt the new one.
 - Every bootstrap starts from a clean, logged-out CLI state, so a failed
   attempt (wrong password, timeout, a process killed mid-login) never blocks
-  the next one.
+  the next one. A clean state also means a fresh `bw` device id, so each
+  bootstrap shows up in Vaultwarden as a **new device** (and, with SMTP
+  configured, a "new device logged in" email). Expect one per fresh task and
+  one per re-bootstrap after a failure or an expired session.
 - Failures are fail-open for Hermes startup and produce only safe,
   non-interactive diagnostics.
 - Hermes reads the vault when a process starts (and again on some later
@@ -128,7 +131,8 @@ source.
 `bw` is a Node program: to trust a private CA (step-ca, mkcert, an internal
 CA) set `NODE_EXTRA_CA_CERTS` in the Hermes environment, since `bw` ignores
 `SSL_CERT_FILE`. The plugin forwards it, along with the standard proxy
-variables, to `bw`.
+variables, to `bw`. These variables are protected too: no vault field can
+change how `bw` reaches the vault.
 
 ## Vault setup and runtime behavior
 

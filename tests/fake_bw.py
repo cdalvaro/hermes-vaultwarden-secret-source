@@ -59,7 +59,7 @@ if args[:2] == ["login", "--apikey"]:
         good["client_id"],
         good["client_secret"],
     ):
-        done(stderr="client_id or client_secret is incorrect. Try again.\n", code=1)
+        done(stderr="Incorrect client_secret\n", code=1)
     state["account"] = "hermes"
     done("You are logged in!\n")
 if args[:1] == ["unlock"]:
