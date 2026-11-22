@@ -23,6 +23,10 @@ It does not use the `bws` CLI for Bitwarden Secrets Manager.
   process bootstraps or replaces an expired session; the others wait for it.
 - Failures are fail-open for Hermes startup and produce only safe,
   non-interactive diagnostics.
+- Hermes reads the vault once per process, so a transient failure (for
+  example, Vaultwarden still restarting) is retried up to three times, five
+  seconds apart, within the same `timeout_seconds` budget. Configuration
+  errors are not retried.
 
 ### Scope the Vaultwarden account
 

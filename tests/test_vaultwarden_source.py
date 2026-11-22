@@ -173,6 +173,7 @@ class TestVaultwardenSource:
         result = self.source.fetch({"enabled": True}, self.home)
         assert result.error_kind == ErrorKind.NOT_CONFIGURED
 
+    @patch.object(vw, "_MAX_ATTEMPTS", 1)
     @patch.object(vw, "find_bw", return_value=Path("/usr/local/bin/bw"))
     @patch.object(vw, "run_secret_cli")
     def test_bootstrap_fails_closed_when_server_configuration_does_not_persist(
@@ -263,6 +264,7 @@ class TestVaultwardenSource:
             ["get", "item", self.item_id],
         ]
 
+    @patch.object(vw, "_MAX_ATTEMPTS", 1)
     @patch.object(vw, "find_bw", return_value=Path("/usr/local/bin/bw"))
     @patch.object(vw, "run_secret_cli")
     def test_unexpected_cli_state_fails_closed_without_sending_credentials(
@@ -335,6 +337,51 @@ class TestVaultwardenSource:
         result = self.source.fetch(self.bootstrap_cfg(), self.home)
 
         assert result.secrets == {"HIDDEN_FIELD": "secret"}
+
+    @patch.object(vw, "find_bw", return_value=Path("/usr/local/bin/bw"))
+    @patch.object(vw, "run_secret_cli")
+    @patch.object(vw.time, "sleep")
+    def test_retries_a_transient_failure_while_vaultwarden_restarts(
+        self, sleep, run_cli, _find_bw
+    ) -> None:
+        hidden = json.dumps({"fields": [{"name": "TOKEN", "value": "s", "type": 1}]})
+        run_cli.side_effect = [
+            *self.bootstrap_responses("session"),
+            subprocess.CompletedProcess(
+                args=[], returncode=1, stdout="", stderr="connection refused"
+            ),
+            subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
+            subprocess.CompletedProcess(args=[], returncode=0, stdout=hidden, stderr=""),
+        ]
+
+        result = self.source.fetch(self.bootstrap_cfg(), self.home)
+
+        assert result.error is None
+        assert result.secrets == {"TOKEN": "s"}
+        assert "Vaultwarden fetch succeeded on attempt 2" in result.warnings
+        sleep.assert_called_once_with(vw._RETRY_DELAY_SECONDS)
+
+    @patch.object(vw, "find_bw", return_value=Path("/usr/local/bin/bw"))
+    @patch.object(vw, "run_secret_cli")
+    @patch.object(vw.time, "sleep")
+    def test_gives_up_after_the_last_attempt(self, sleep, run_cli, _find_bw) -> None:
+        down = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr="connection refused"
+        )
+        run_cli.side_effect = [*self.bootstrap_responses("session"), *[down] * 3]
+
+        result = self.source.fetch(self.bootstrap_cfg(), self.home)
+
+        assert result.error_kind == ErrorKind.NETWORK
+        assert sleep.call_count == vw._MAX_ATTEMPTS - 1
+        assert run_cli.call_count == 5 + vw._MAX_ATTEMPTS
+
+    @patch.object(vw.time, "sleep")
+    def test_configuration_errors_are_not_retried(self, sleep) -> None:
+        result = self.source.fetch({"enabled": True}, self.home)
+
+        assert result.error_kind == ErrorKind.NOT_CONFIGURED
+        sleep.assert_not_called()
 
     @patch.object(vw, "find_bw", return_value=Path("/usr/local/bin/bw"))
     @patch.object(vw, "run_secret_cli")

@@ -92,6 +92,13 @@ except ImportError:
     )
 
 _DEFAULT_TIMEOUT_SECONDS = 90.0
+# A few spaced attempts ride out a Vaultwarden restart; all of them share the
+# single fetch deadline, so a real outage still ends within timeout_seconds.
+_MAX_ATTEMPTS = 3
+_RETRY_DELAY_SECONDS = 5.0
+_PERMANENT_ERRORS = frozenset(
+    {ErrorKind.NOT_CONFIGURED, ErrorKind.BINARY_MISSING, ErrorKind.REF_INVALID}
+)
 _DEFAULT_RUNTIME_DIR = Path(tempfile.gettempdir()) / "hermes-vaultwarden"
 _BOOTSTRAP_ENV_NAMES = frozenset({"BW_CLIENTID", "BW_CLIENTSECRET", "BW_PASSWORD"})
 _HIDDEN_FIELD_TYPE = 1  # bw's `fields[].type`: 0 text, 1 hidden, 2 boolean, 3 linked
@@ -189,9 +196,27 @@ class VaultwardenSource(SecretSource):
         }
 
     def fetch(self, cfg: dict, home_path: Path) -> FetchResult:
+        """Fetch with a short retry: Hermes reads the vault once per process,
+        so a Vaultwarden that is still restarting would otherwise leave the
+        process without secrets until it is restarted."""
         cfg = cfg if isinstance(cfg, dict) else {}
-        result = FetchResult()
         deadline = time.monotonic() + self.fetch_timeout_seconds(cfg)
+        attempt = 1
+        while True:
+            result = self._fetch_once(cfg, home_path, deadline)
+            if not _is_transient(result) or attempt >= _MAX_ATTEMPTS:
+                break
+            remaining = _remaining_seconds(deadline)
+            if remaining is None or remaining <= _RETRY_DELAY_SECONDS:
+                break
+            time.sleep(_RETRY_DELAY_SECONDS)
+            attempt += 1
+        if attempt > 1 and result.secrets:
+            result.warnings.append(f"Vaultwarden fetch succeeded on attempt {attempt}")
+        return result
+
+    def _fetch_once(self, cfg: dict, home_path: Path, deadline: float) -> FetchResult:
+        result = FetchResult()
         session_env = _session_env(cfg)
         if not is_valid_env_name(session_env):
             result.error = "secrets.vaultwarden.session_env is not a valid environment variable name"
@@ -550,6 +575,15 @@ def _bootstrap_error_kind(cfg: dict, deadline: float) -> ErrorKind:
         if _bootstrap_is_configured(cfg)
         else ErrorKind.NOT_CONFIGURED
     )
+
+
+def _is_transient(result: FetchResult) -> bool:
+    """Worth retrying: any error but a configuration one (a restarting server
+    also looks like AUTH_FAILED to the bootstrap), or no secrets at all because
+    every item read failed."""
+    if result.error:
+        return result.error_kind not in _PERMANENT_ERRORS
+    return not result.secrets and bool(result.warnings)
 
 
 def _error_kind(result, deadline: float) -> ErrorKind:
