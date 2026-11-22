@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # Weekly, so a new Hermes release that breaks the contract shows up
+    # even when nothing changes here.
+    - cron: "17 6 * * 1"
 
 env:
   # Pin the Hermes secret-source contract we test against; bump deliberately.
@@ -11,23 +15,40 @@ env:
 
 jobs:
   test:
+    name: test (py${{ matrix.python-version }}, hermes ${{ matrix.hermes }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12", "3.13", "3.14"]
+        hermes: [pinned, latest]
     steps:
       - name: Checkout plugin
         uses: actions/checkout@v7
+
+      - name: Resolve hermes-agent ref
+        id: hermes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ matrix.hermes }}" = latest ]; then
+            ref=$(gh api repos/NousResearch/hermes-agent/releases/latest --jq .tag_name)
+          else
+            ref="$HERMES_AGENT_REF"
+          fi
+          echo "Testing against hermes-agent $ref"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
 
       - name: Checkout hermes-agent secret-source contract
         uses: actions/checkout@v7
         with:
           repository: NousResearch/hermes-agent
-          ref: ${{ env.HERMES_AGENT_REF }}
+          ref: ${{ steps.hermes.outputs.ref }}
           sparse-checkout: |
             agent/secret_sources
+            agent/provider_registry.py
             hermes_constants.py
+            utils
             tests/__init__.py
             tests/secret_sources
           sparse-checkout-cone-mode: false
